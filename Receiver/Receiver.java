@@ -1,135 +1,169 @@
+import java.io.*;
 import java.net.*;
+import java.util.Arrays;
 
 public class Receiver {
 
-    // ── tunables ──────────────────────────────────────────────────────────────
-    private static final int TIMEOUT_MS   = 3000;  // socket timeout
-    private static final int MAX_TIMEOUTS = 3;      // consecutive timeout limit
-
-    // ── state ─────────────────────────────────────────────────────────────────
+    // state
     private DatagramSocket socket;
     private InetAddress    senderAddr;
     private int            senderPort;
     private int            ackCount = 0;   // 1-indexed ACK counter for ChaosEngine
     private int            rn;             // reliability number
+    private FileOutputStream fos;          // Stream to write the output file
 
-    // ── constructor ───────────────────────────────────────────────────────────
-    public Receiver(int port, int rn) throws Exception {
-        this.socket = new DatagramSocket(port);  // bind to known port
-        this.socket.setSoTimeout(TIMEOUT_MS);
+    // constructors
+    public Receiver(int port, int rn, String outputFile) throws Exception {
+        this.socket = new DatagramSocket(port); 
+        this.socket.setSoTimeout(0); // Infinite timeout: waits patiently for Sender
         this.rn = rn;
+        this.fos = new FileOutputStream(outputFile);
         System.out.println("[Receiver] Listening on port " + port);
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────────
+    // ── helpers
 
-    /** Block until a 128-byte datagram arrives; records sender address for replies. */
+    /** Block until proper datagram arrives*/
     private DSPacket receivePacket() throws Exception {
         byte[]         buf = new byte[DSPacket.MAX_PACKET_SIZE];
         DatagramPacket udp = new DatagramPacket(buf, buf.length);
         socket.receive(udp);
 
-        // Remember who sent this so we can reply
+        // Dynamically capture the actual port the untouched Sender.java is using
         this.senderAddr = udp.getAddress();
         this.senderPort = udp.getPort();
 
         return new DSPacket(udp.getData());
     }
 
-    /** Send any DSPacket back to the sender, respecting ChaosEngine ACK drops. */
-    private void sendACK(DSPacket pkt) throws Exception {
+    /** Send an ACK back to the sender*/
+    private void sendACK(int seqNum) throws Exception {
         ackCount++;  // 1-indexed
 
         if (ChaosEngine.shouldDrop(ackCount, rn)) {
-            System.out.println("[Receiver] ACK #" + ackCount + " DROPPED (Seq=" + pkt.getSeqNum() + ") by ChaosEngine");
+            System.out.println("[Receiver] ACK #" + ackCount + " DROPPED (Seq=" + seqNum + ") by ChaosEngine");
             return;
         }
 
-        byte[]         data = pkt.toBytes();
+        DSPacket ack = new DSPacket(DSPacket.TYPE_ACK, seqNum, null);
+        byte[]         data = ack.toBytes();
         DatagramPacket udp  = new DatagramPacket(data, data.length, senderAddr, senderPort);
         socket.send(udp);
-        System.out.println("[Receiver] ACK sent (Seq=" + pkt.getSeqNum() + ")");
+        System.out.println("[Receiver] ACK sent (Seq=" + seqNum + ")");
     }
 
-    // ── Phase 1: Handshake ────────────────────────────────────────────────────
+    // Handshake
 
-    /**
-     * Waits for SOT (Type=0, Seq=0) from sender, replies with ACK(0).
-     * Retries up to MAX_TIMEOUTS times if nothing arrives.
-     *
-     * @return true if handshake succeeded, false if max timeouts exceeded
-     */
-    public boolean handshake() throws Exception {
-        int timeoutCount = 0;
+    public void handshake() throws Exception {
+        while (true) {
+            DSPacket pkt = receivePacket();
 
-        while (timeoutCount < MAX_TIMEOUTS) {
-            try {
-                DSPacket pkt = receivePacket();
-
-                // Validate: must be SOT with Seq=0
-                if (pkt.getType() == DSPacket.TYPE_SOT && pkt.getSeqNum() == 0) {
-                    System.out.println("[Receiver] SOT received (Seq=0)");
-
-                    // Reply with ACK(0)
-                    DSPacket ack = new DSPacket(DSPacket.TYPE_ACK, 0, null);
-                    sendACK(ack);
-
-                    System.out.println("[Receiver] Handshake complete");
-                    return true;
-                } else {
-                    System.out.println("[Receiver] Unexpected packet during handshake — ignoring");
-                }
-
-            } catch (SocketTimeoutException e) {
-                timeoutCount++;
-                System.out.println("[Receiver] Timeout #" + timeoutCount + " waiting for SOT");
+            // See if SOT with Seq=0
+            if (pkt.getType() == DSPacket.TYPE_SOT && pkt.getSeqNum() == 0) {
+                System.out.println("[Receiver] SOT received (Seq=0)");
+                sendACK(0);
+                System.out.println("[Receiver] Handshake complete");
+                return;
+            } else {
+                System.out.println("[Receiver] Unexpected packet during handshake — ignoring");
             }
         }
-
-        System.out.println("[Receiver] ERROR: No SOT received after " + MAX_TIMEOUTS + " timeouts");
-        return false;
     }
 
-    // ── Entry point ───────────────────────────────────────────────────────────
+    // Universal Data Transfer 
+    public void receiveData() throws Exception {
+        int expectedSeq = 1;
+        int lastAckSeq = 0;
+        DSPacket[] buffer = new DSPacket[128]; // Buffer for GBN out-of-order packets
 
-    /**
-     * Usage: java Receiver <rcv_data_port> <output_file> <mode> [rn]
-     *   rcv_data_port : port to listen on
-     *   output_file   : file to write received data to
-     *   mode          : saw (Stop-and-Wait) | gbn (Go-Back-N)
-     *   rn            : reliability number (optional, default 0 = no loss)
-     */
+        System.out.println("[Receiver] Ready for data transfer...");
+
+        while (true) {
+            DSPacket pkt = receivePacket();
+            int type = pkt.getType();
+            int seq = pkt.getSeqNum();
+
+            if (type == DSPacket.TYPE_DATA) {
+                System.out.println("[Receiver] Received DATA seq=" + seq + " len=" + pkt.getLength());
+                
+                // Calculate distance utilizing wrap-around modulo 128 arithmetic
+                int dist = (seq - expectedSeq + 128) % 128;
+                
+                if (dist == 0) {
+                    // 1. In-order packet received
+                    fos.write(pkt.getPayload());
+                    expectedSeq = (expectedSeq + 1) % 128;
+                    lastAckSeq = seq;
+                    
+                    // 2. Deliver any contiguous buffered packets
+                    while (buffer[expectedSeq] != null) {
+                        DSPacket bufferedPkt = buffer[expectedSeq];
+                        fos.write(bufferedPkt.getPayload());
+                        System.out.println("[Receiver] Delivered buffered DATA seq=" + expectedSeq);
+                        
+                        buffer[expectedSeq] = null; // Clear from buffer
+                        lastAckSeq = expectedSeq;
+                        expectedSeq = (expectedSeq + 1) % 128;
+                    }
+                    sendACK(lastAckSeq); // Cumulative ACK
+                } 
+                else if (dist > 0 && dist < 120) {
+                    // Out-of-order packet inside future receive window
+                    if (buffer[seq] == null) {
+                        System.out.println("[Receiver] Buffering out-of-order DATA seq=" + seq);
+                        buffer[seq] = pkt;
+                    } else {
+                        System.out.println("[Receiver] Duplicate out-of-order DATA seq=" + seq + " ignored");
+                    }
+                    sendACK(lastAckSeq); // Re-send cumulative ACK
+                } 
+                else {
+                    // 4. Old or duplicate packet - out of window
+                    System.out.println("[Receiver] Old/Duplicate DATA seq=" + seq + " ignored");
+                    sendACK(lastAckSeq);
+                }
+            } 
+            else if (type == DSPacket.TYPE_EOT) {
+                System.out.println("[Receiver] Received EOT seq=" + seq);
+                sendACK(seq);
+                
+                // teardown
+                fos.close();
+                System.out.println("[Receiver] Teardown complete. Exiting.");
+                break;
+            }
+            else if (type == DSPacket.TYPE_SOT) {
+                // Edge case - if Sender's SOT ACK was lost and retransmits
+                System.out.println("[Receiver] Received duplicate SOT seq=0");
+                sendACK(0);
+            }
+        }
+    }
+
+    // entry
+
     public static void main(String[] args) throws Exception {
 
-        if (args.length < 3) {
-            System.out.println("Usage: java Receiver <port> <output_file> <saw|gbn> [rn]");
+       
+        if (args.length < 5) {
+            System.out.println("Usage: java Receiver <sender_ip> <sender_ack_port> <rcv_data_port> <output_file> <RN>");
             return;
         }
 
-        int    port       = Integer.parseInt(args[0]);
-        String outputFile = args[1];
-        String mode       = args[2].toLowerCase();
-        int    rn         = args.length >= 4 ? Integer.parseInt(args[3]) : 0;
+        // Parsing
+        String senderIp     = args[0]; 
+        int senderAckPort   = Integer.parseInt(args[1]); 
+        int rcvDataPort     = Integer.parseInt(args[2]);
+        String outputFile   = args[3];
+        int rn              = Integer.parseInt(args[4]);
 
-        Receiver receiver = new Receiver(port, rn);
+        Receiver receiver = new Receiver(rcvDataPort, rn, outputFile);
 
-        // ── Phase 1: Handshake ────────────────────────────────────────────────
-        if (!receiver.handshake()) {
-            receiver.socket.close();
-            return;
-        }
+        
+        receiver.handshake();
 
-        // ── Phase 2: Data Transfer (to be implemented) ────────────────────────
-        if (mode.equals("saw")) {
-            System.out.println("[Receiver] Mode: Stop-and-Wait (to be implemented)");
-            // TODO: receiver.receiveFileStopAndWait(outputFile);
-        } else if (mode.equals("gbn")) {
-            System.out.println("[Receiver] Mode: Go-Back-N (to be implemented)");
-            // TODO: receiver.receiveFileGBN(outputFile);
-        } else {
-            System.out.println("[Receiver] ERROR: unknown mode '" + mode + "'");
-        }
-
+        receiver.receiveData();
+        
         receiver.socket.close();
     }
 }
