@@ -6,16 +6,16 @@ public class Receiver {
 
     // state
     private DatagramSocket socket;
-    private InetAddress    senderAddr;
-    private int            senderPort;
-    private int            ackCount = 0;   // 1-indexed ACK counter for ChaosEngine
-    private int            rn;             // reliability number
-    private FileOutputStream fos;          // Stream to write the output file
+    private InetAddress  senderAddr;
+    private int senderPort;
+    private int ackCount = 0;   /
+    private int rn;            
+    private FileOutputStream fos;          /
 
     // constructors
     public Receiver(int port, int rn, String outputFile) throws Exception {
         this.socket = new DatagramSocket(port); 
-        this.socket.setSoTimeout(0); // Infinite timeout: waits patiently for Sender
+        this.socket.setSoTimeout(0); // Infinite timeout waits patiently for Sender
         this.rn = rn;
         this.fos = new FileOutputStream(outputFile);
         System.out.println("[Receiver] Listening on port " + port);
@@ -51,8 +51,6 @@ public class Receiver {
         socket.send(udp);
         System.out.println("[Receiver] ACK sent (Seq=" + seqNum + ")");
     }
-
-    // Handshake
 
     public void handshake() throws Exception {
         while (true) {
@@ -90,12 +88,12 @@ public class Receiver {
                 int dist = (seq - expectedSeq + 128) % 128;
                 
                 if (dist == 0) {
-                    // 1. In-order packet received
+                    // In-order packet received
                     fos.write(pkt.getPayload());
                     expectedSeq = (expectedSeq + 1) % 128;
                     lastAckSeq = seq;
                     
-                    // 2. Deliver any contiguous buffered packets
+                    // Deliver any contiguous buffered packets
                     while (buffer[expectedSeq] != null) {
                         DSPacket bufferedPkt = buffer[expectedSeq];
                         fos.write(bufferedPkt.getPayload());
@@ -118,7 +116,7 @@ public class Receiver {
                     sendACK(lastAckSeq); // Re-send cumulative ACK
                 } 
                 else {
-                    // 4. Old or duplicate packet - out of window
+                    // Old or duplicate packet - out of window
                     System.out.println("[Receiver] Old/Duplicate DATA seq=" + seq + " ignored");
                     sendACK(lastAckSeq);
                 }
@@ -127,13 +125,11 @@ public class Receiver {
                 System.out.println("[Receiver] Received EOT seq=" + seq);
                 sendACK(seq);
                 
-                // teardown
                 fos.close();
                 System.out.println("[Receiver] Teardown complete. Exiting.");
                 break;
             }
             else if (type == DSPacket.TYPE_SOT) {
-                // Edge case - if Sender's SOT ACK was lost and retransmits
                 System.out.println("[Receiver] Received duplicate SOT seq=0");
                 sendACK(0);
             }
@@ -151,19 +147,16 @@ public class Receiver {
         }
 
         // Parsing
-        String senderIp     = args[0]; 
-        int senderAckPort   = Integer.parseInt(args[1]); 
-        int rcvDataPort     = Integer.parseInt(args[2]);
-        String outputFile   = args[3];
-        int rn              = Integer.parseInt(args[4]);
+        String senderIp = args[0]; 
+        int senderAckPort = Integer.parseInt(args[1]); 
+        int rcvDataPort = Integer.parseInt(args[2]);
+        String outputFile = args[3];
+        int rn = Integer.parseInt(args[4]);
 
         Receiver receiver = new Receiver(rcvDataPort, rn, outputFile);
 
-        
         receiver.handshake();
-
         receiver.receiveData();
-        
         receiver.socket.close();
     }
 }

@@ -5,29 +5,30 @@ import java.util.List;
 
 public class Sender {
 
-    private static final int TIMEOUT_MS = 3000;
     private static final int MAX_TIMEOUTS = 3;
 
     private DatagramSocket socket;
     private InetAddress receiverAddr;
     private int receiverPort;
+    private int timeoutMs;
 
-    // sets up the socket and connects to the receiver address
-    public Sender(String host, int port) throws Exception {
-        receiverAddr = InetAddress.getByName(host);
-        receiverPort = port;
-        socket = new DatagramSocket();
-        socket.setSoTimeout(TIMEOUT_MS);
+    // sets up the socket, binds to senderAckPort so receiver knows where to send ACKs
+    public Sender(String rcvIp, int rcvDataPort, int senderAckPort, int timeoutMs) throws Exception {
+        receiverAddr = InetAddress.getByName(rcvIp);
+        receiverPort = rcvDataPort;
+        this.timeoutMs = timeoutMs;
+        socket = new DatagramSocket(senderAckPort);
+        socket.setSoTimeout(timeoutMs);
     }
 
-    // wraps a DSPacket into a UDP datagram and sends it
+    // wraps a DSPacket into a UDP datagram and sends it to the receiver
     private void sendPacket(DSPacket pkt) throws Exception {
         byte[] data = pkt.toBytes();
         DatagramPacket udp = new DatagramPacket(data, data.length, receiverAddr, receiverPort);
         socket.send(udp);
     }
 
-    // blocks until a packet arrives and returns it as a DSPacket
+    // blocks until a packet arrives on our ack port and returns it as a DSPacket
     private DSPacket receivePacket() throws Exception {
         byte[] buf = new byte[DSPacket.MAX_PACKET_SIZE];
         DatagramPacket udp = new DatagramPacket(buf, buf.length);
@@ -60,7 +61,7 @@ public class Sender {
         return false;
     }
 
-    // stop and wait - sends one packet at a time and waits for its ACK
+    // stop and wait - sends one packet at a time and waits for its ACK before moving on
     public void sendFileStopAndWait(String filename) throws Exception {
         File file = new File(filename);
 
@@ -112,7 +113,7 @@ public class Sender {
         sendEOT(seq);
     }
 
-    // go back n - sends a whole window at a time, retransmits all on timeout
+    // go back n - sends a full window at a time and retransmits everything from base on timeout
     public void sendFileGBN(String filename, int windowSize) throws Exception {
         File file = new File(filename);
 
@@ -203,7 +204,7 @@ public class Sender {
         sendEOT(eotSeq);
     }
 
-    // sends EOT and waits for ACK
+    // sends EOT and waits for ACK to confirm clean teardown
     private void sendEOT(int seq) throws Exception {
         DSPacket eot = new DSPacket(DSPacket.TYPE_EOT, seq, null);
         int timeouts = 0;
@@ -229,36 +230,39 @@ public class Sender {
 
     // entry point, parses args and kicks off the handshake and transfer
     public static void main(String[] args) throws Exception {
-        if (args.length < 4) {
-            System.out.println("Usage: java Sender <host> <port> <file> <saw|gbn> [window_size]");
+        // Usage: java Sender <rcv_ip> <rcv_data_port> <sender_ack_port> <input_file> <timeout_ms> [window_size]
+        if (args.length < 5) {
+            System.out.println("Usage: java Sender <rcv_ip> <rcv_data_port> <sender_ack_port> <input_file> <timeout_ms> [window_size]");
             return;
         }
 
-        String host = args[0];
-        int port = Integer.parseInt(args[1]);
-        String filename = args[2];
-        String mode = args[3].toLowerCase();
+        String rcvIp        = args[0];
+        int rcvDataPort     = Integer.parseInt(args[1]);
+        int senderAckPort   = Integer.parseInt(args[2]);
+        String filename     = args[3];
+        int timeoutMs       = Integer.parseInt(args[4]);
+        boolean isGBN       = args.length >= 6;
+        int windowSize      = isGBN ? Integer.parseInt(args[5]) : 0;
 
-        Sender sender = new Sender(host, port);
+        Sender sender = new Sender(rcvIp, rcvDataPort, senderAckPort, timeoutMs);
+
+        long startTime = System.currentTimeMillis();
 
         if (!sender.handshake()) {
             sender.socket.close();
             return;
         }
 
-        if (mode.equals("saw")) {
-            sender.sendFileStopAndWait(filename);
-        } else if (mode.equals("gbn")) {
-            if (args.length < 5) {
-                System.out.println("[Sender] need window size for gbn");
-                sender.socket.close();
-                return;
-            }
-            int windowSize = Integer.parseInt(args[4]);
+        if (isGBN) {
+            System.out.println("[Sender] Mode: Go-Back-N window=" + windowSize);
             sender.sendFileGBN(filename, windowSize);
         } else {
-            System.out.println("[Sender] unknown mode: " + mode);
+            System.out.println("[Sender] Mode: Stop-and-Wait");
+            sender.sendFileStopAndWait(filename);
         }
+
+        long elapsed = System.currentTimeMillis() - startTime;
+        System.out.printf("Total Transmission Time: %.2f seconds%n", elapsed / 1000.0);
 
         sender.socket.close();
     }
